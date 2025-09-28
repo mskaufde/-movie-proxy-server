@@ -1,19 +1,32 @@
-const WebTorrent = require('webtorrent');
-
 class TorrentStreamer {
   constructor() {
-    this.client = new WebTorrent();
     this.activeTorrents = new Map();
     this.streamingClients = new Map();
     
-    // Cleanup inactive torrents every 30 minutes
-    setInterval(() => {
-      this.cleanupInactiveTorrents();
-    }, 30 * 60 * 1000);
+    // Try to import WebTorrent dynamically
+    this.initWebTorrent();
+  }
+
+  async initWebTorrent() {
+    try {
+      // Dynamic import for ESM compatibility
+      const WebTorrentModule = await import('webtorrent');
+      const WebTorrent = WebTorrentModule.default || WebTorrentModule;
+      this.client = new WebTorrent();
+      console.log('WebTorrent initialized successfully');
+    } catch (error) {
+      console.warn('WebTorrent not available, using fallback streaming:', error.message);
+      this.client = null;
+    }
   }
 
   async streamTorrent(torrentInfo, res) {
     try {
+      // If WebTorrent is not available, redirect to magnet link
+      if (!this.client) {
+        return this.fallbackStream(torrentInfo, res);
+      }
+
       const magnetLink = torrentInfo.magnetLink;
       const torrentId = this.getTorrentId(magnetLink);
       
@@ -46,10 +59,26 @@ class TorrentStreamer {
     }
   }
 
+  fallbackStream(torrentInfo, res) {
+    // Fallback: redirect to magnet link or show message
+    res.setHeader('Content-Type', 'application/json');
+    res.json({
+      error: 'Direct streaming not available',
+      message: 'Please use a torrent client to download this content',
+      magnetLink: torrentInfo.magnetLink,
+      title: torrentInfo.title || 'Unknown',
+      seeders: torrentInfo.seeders || 0
+    });
+  }
+
   addTorrent(magnetLink) {
     return new Promise((resolve, reject) => {
+      if (!this.client) {
+        reject(new Error('WebTorrent client not available'));
+        return;
+      }
+
       const torrent = this.client.add(magnetLink, {
-        // Prioritize sequential downloading for streaming
         strategy: 'sequential'
       });
       
@@ -84,7 +113,7 @@ class TorrentStreamer {
           torrent.destroy();
           reject(new Error('Torrent loading timeout'));
         }
-      }, 30000); // 30 second timeout
+      }, 30000);
     });
   }
 
@@ -146,37 +175,42 @@ class TorrentStreamer {
       bytesStreamed: 0
     });
     
-    // Create read stream
-    const stream = videoFile.createReadStream({ start, end });
-    
-    stream.on('data', (chunk) => {
-      const client = this.streamingClients.get(streamId);
-      if (client) {
-        client.bytesStreamed += chunk.length;
-      }
-    });
-    
-    stream.on('error', (error) => {
-      console.error('Stream error:', error);
-      this.streamingClients.delete(streamId);
-      if (!res.headersSent) {
-        res.status(500).end();
-      }
-    });
-    
-    stream.on('end', () => {
-      console.log(`Stream completed: ${streamId}`);
-      this.streamingClients.delete(streamId);
-    });
-    
-    res.on('close', () => {
-      console.log(`Client disconnected: ${streamId}`);
-      this.streamingClients.delete(streamId);
-      stream.destroy();
-    });
-    
-    // Pipe the stream to response
-    stream.pipe(res);
+    try {
+      // Create read stream
+      const stream = videoFile.createReadStream({ start, end });
+      
+      stream.on('data', (chunk) => {
+        const client = this.streamingClients.get(streamId);
+        if (client) {
+          client.bytesStreamed += chunk.length;
+        }
+      });
+      
+      stream.on('error', (error) => {
+        console.error('Stream error:', error);
+        this.streamingClients.delete(streamId);
+        if (!res.headersSent) {
+          res.status(500).end();
+        }
+      });
+      
+      stream.on('end', () => {
+        console.log(`Stream completed: ${streamId}`);
+        this.streamingClients.delete(streamId);
+      });
+      
+      res.on('close', () => {
+        console.log(`Client disconnected: ${streamId}`);
+        this.streamingClients.delete(streamId);
+        stream.destroy();
+      });
+      
+      // Pipe the stream to response
+      stream.pipe(res);
+    } catch (error) {
+      console.error('Stream setup error:', error);
+      res.status(500).json({ error: 'Failed to setup stream' });
+    }
   }
 
   getContentType(filename) {
@@ -201,29 +235,6 @@ class TorrentStreamer {
     return match ? match[1].toLowerCase() : magnetLink.substring(0, 40);
   }
 
-  cleanupInactiveTorrents() {
-    console.log('Cleaning up inactive torrents...');
-    
-    const activeStreams = new Set();
-    this.streamingClients.forEach(client => {
-      activeStreams.add(client.torrentId);
-    });
-    
-    this.activeTorrents.forEach((torrent, torrentId) => {
-      // Remove torrents that haven't been accessed in 1 hour
-      if (!activeStreams.has(torrentId)) {
-        const lastAccessed = torrent.lastAccessed || torrent.created;
-        const hoursSinceAccess = (Date.now() - lastAccessed) / (1000 * 60 * 60);
-        
-        if (hoursSinceAccess > 1) {
-          console.log(`Removing inactive torrent: ${torrentId}`);
-          torrent.destroy();
-          this.activeTorrents.delete(torrentId);
-        }
-      }
-    });
-  }
-
   getStats() {
     const streamingCount = this.streamingClients.size;
     const activeTorrentCount = this.activeTorrents.size;
@@ -233,9 +244,9 @@ class TorrentStreamer {
     let totalPeers = 0;
     
     this.activeTorrents.forEach(torrent => {
-      totalDownloaded += torrent.downloaded;
-      totalUploaded += torrent.uploaded;
-      totalPeers += torrent.numPeers;
+      totalDownloaded += torrent.downloaded || 0;
+      totalUploaded += torrent.uploaded || 0;
+      totalPeers += torrent.numPeers || 0;
     });
     
     return {
@@ -244,7 +255,8 @@ class TorrentStreamer {
       totalDownloaded: this.formatBytes(totalDownloaded),
       totalUploaded: this.formatBytes(totalUploaded),
       totalPeers,
-      clientRatio: totalUploaded / (totalDownloaded || 1)
+      clientRatio: totalUploaded / (totalDownloaded || 1),
+      webTorrentAvailable: !!this.client
     };
   }
 
@@ -263,21 +275,23 @@ class TorrentStreamer {
     // Clear all streaming clients
     this.streamingClients.clear();
     
-    // Destroy all active torrents
-    const destroyPromises = [];
-    this.activeTorrents.forEach(torrent => {
-      destroyPromises.push(new Promise(resolve => {
-        torrent.destroy(resolve);
-      }));
-    });
-    
-    await Promise.all(destroyPromises);
-    this.activeTorrents.clear();
-    
-    // Destroy WebTorrent client
-    return new Promise(resolve => {
-      this.client.destroy(resolve);
-    });
+    if (this.client) {
+      // Destroy all active torrents
+      const destroyPromises = [];
+      this.activeTorrents.forEach(torrent => {
+        destroyPromises.push(new Promise(resolve => {
+          torrent.destroy(resolve);
+        }));
+      });
+      
+      await Promise.all(destroyPromises);
+      this.activeTorrents.clear();
+      
+      // Destroy WebTorrent client
+      return new Promise(resolve => {
+        this.client.destroy(resolve);
+      });
+    }
   }
 }
 
